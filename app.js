@@ -8,8 +8,8 @@ const io = new Server(server, {
   cors: {
     origin: process.env.CLIENT_URL || "https://file-share-puce-rho.vercel.app",
     methods: ["GET", "POST"],
-    credentials: true,
   },
+  maxHttpBufferSize: 100 * 1024 * 1024, // 100 MB, matches your client's MAX_FILE_SIZE
 });
 app.use(express.json());
 
