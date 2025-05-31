@@ -6,13 +6,16 @@ const app = express();
 export const server = createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: process.env.CLIENT_URL || "https://file-share-puce-rho.vercel.app",
+    origin: process.env.CLIENT_URL || "https://fs.vercel.app",
     methods: ["GET", "POST"],
   },
   maxHttpBufferSize: 100 * 1024 * 1024, // 100 MB, matches your client's MAX_FILE_SIZE
 });
 app.use(express.json());
 
+app.get("/", (req, res) => {
+  res.send("wellcome to fast file share page")
+});
 // Track online users by their UID and socketId
 const onlineUsers = {}; // { uid: { name, photo, socketId } }
 // Track active rooms and their participants (UIDs)
