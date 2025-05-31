@@ -9,7 +9,7 @@ const io = new Server(server, {
     origin: process.env.CLIENT_URL || "https://fs.vercel.app",
     methods: ["GET", "POST"],
   },
-  maxHttpBufferSize: 100 * 1024 * 1024, // 100 MB, matches your client's MAX_FILE_SIZE
+  maxHttpBufferSize: 5 * 1024 * 1024 * 1024, // 5GB, matches your client's MAX_FILE_SIZE
 });
 app.use(express.json());
 
@@ -17,18 +17,14 @@ app.get("/", (req, res) => {
   res.send("wellcome to fast file share page")
 });
 // Track online users by their UID and socketId
-const onlineUsers = {}; // { uid: { name, photo, socketId } }
-// Track active rooms and their participants (UIDs)
-const activeRooms = {}; // { roomId: Set<uid> }
+const onlineUsers = {};
+const activeRooms = {}; // Structure: { roomId: Set<uid> }
 
-// Helper functions
 const getUserSocketId = (uid) => onlineUsers[uid]?.socketId || null;
 
-// Socket.IO connection handler
 io.on("connection", (socket) => {
-  // console.log(`New connection: ${socket.id}`);
+  // console.log(`User connected: ${socket.id}`);
 
-  // User management
   socket.on("new_user", (userData) => {
     if (!userData?.uid || !userData?.name) {
       socket.emit("error", {
@@ -36,13 +32,11 @@ io.on("connection", (socket) => {
       });
       return;
     }
-    // Store user data with their current socket ID
     onlineUsers[userData.uid] = { ...userData, socketId: socket.id };
     io.emit("update_online_users", Object.values(onlineUsers));
-    console.log(`User registered: ${userData.name} (${userData.uid})`);
+    // console.log(`User registered: ${userData.name} (${userData.uid})`);
   });
 
-  // File sharing functionality
   socket.on("send_file", ({ roomId, file }) => {
     if (!roomId || !file) {
       socket.emit("error", { message: "Room ID and file are required" });
@@ -53,16 +47,11 @@ io.on("connection", (socket) => {
       socket.emit("error", { message: "You're not in this room" });
       return;
     }
-
-    // Validate file data
     if (!file.data || !file.name || !file.size) {
       socket.emit("error", { message: "Invalid file data" });
       return;
     }
-
-    // Broadcast file to other room participants
     socket.to(roomId).emit("new_file", file);
-    // console.log(`File shared in room ${roomId}: ${file.name}`);
   });
 
   // Connection request handling
@@ -128,6 +117,16 @@ io.on("connection", (socket) => {
       socket.emit("error", { message: "Invalid room join request" });
       return;
     }
+
+    // Check if the room already has 2 participants
+    if (activeRooms[roomId] && activeRooms[roomId].size >= 2) {
+      // You might want to handle this differently, e.g., send an error to the joining user
+      // or redirect them. For now, we'll prevent joining.
+      socket.emit("error", { message: "Room is full. Cannot join." });
+      console.warn(`Attempted join on full room ${roomId} by ${user.name}`);
+      return;
+    }
+
     socket.join(roomId);
     socket.roomId = roomId; // Store roomId on the socket for easy access later
     socket.user = user; // Store user data on the socket for easy access later
@@ -138,113 +137,158 @@ io.on("connection", (socket) => {
     }
     activeRooms[roomId].add(user.uid);
 
-    // Notify others in the room that a user connected
-    // This is for the "connected_user" event on the client
+    // Notify other users in the room about the new joiner
     socket.to(roomId).emit("connected_user", user);
-    // console.log(`${user.name} joined room ${roomId}`);
+    console.log(`${user.name} (UID: ${user.uid}) joined room ${roomId}`);
 
-    // Optional: If you want to notify the joining user about existing users in the room
-    // You might need to fetch and send the existing user data here.
-  });
-
-  socket.on("leave_room", () => {
-    if (!socket.roomId || !socket.user) return; // Ensure socket has room and user data
-    const { roomId, user } = socket;
-
-    // console.log(`${user.name} is explicitly leaving room ${roomId}`);
-
-    // Remove user from the room's participant set
-    if (activeRooms[roomId]) {
-      activeRooms[roomId].delete(user.uid);
-
-      // Notify other clients in the room that this user has left
-      socket.to(roomId).emit("user_left", user);
-
-      // Check if the room is now empty or has only one participant left
-      if (activeRooms[roomId].size === 0) {
-        delete activeRooms[roomId]; // Room is empty, remove it
-        // console.log(`Room ${roomId} is now empty.`);
-      } else if (activeRooms[roomId].size === 1) {
-        // Only one person left in the room
-        const remainingUid = activeRooms[roomId].values().next().value;
-        const remainingUserSocketId = getUserSocketId(remainingUid);
-
-        if (remainingUserSocketId) {
-          // Emit a user_left event to the remaining user,
-          // so their client-side logic redirects them.
-          io.to(remainingUserSocketId).emit("user_left", {
-            uid: user.uid, // The UID of the user who just left
-            name: user.name, // The name of the user who just left
-          });
-          // console.log(
-          //   `User ${user.name} left. Redirecting remaining user ${remainingUid} from room ${roomId}.`
-          // );
+    // If there's another user already in the room, send their info to the new joiner
+    // This handles the case where a second user joins an existing room
+    if (activeRooms[roomId].size > 1) {
+      const otherUid = Array.from(activeRooms[roomId]).find(
+        (uid) => uid !== user.uid
+      );
+      if (otherUid) {
+        const otherUser = onlineUsers[otherUid];
+        if (otherUser) {
+          socket.emit("connected_user", otherUser);
+          console.log(
+            `Sent info about existing user ${otherUser.name} to new joiner ${user.name} in room ${roomId}`
+          );
         }
-        delete activeRooms[roomId]; // Room should be considered closed for new joins
-        // console.log(`Room ${roomId} now has only one user, closing the room.`);
       }
     }
-    socket.leave(roomId);
-    // Clean up socket's room and user data
-    socket.roomId = null;
-    socket.user = null;
+  });
+
+  // Corrected exit_room logic with callback
+  socket.on("exit_room", ({ roomId, user }, callback) => {
+    if (!roomId || !user?.uid) {
+      if (callback) {
+        callback({ success: false, message: "Invalid exit room request" });
+      }
+      return;
+    }
+
+    if (socket.rooms.has(roomId)) {
+      socket.leave(roomId);
+
+      if (activeRooms[roomId]) {
+        activeRooms[roomId].delete(user.uid);
+        console.log(
+          `User ${user.name} (UID: ${user.uid}) left room ${roomId} voluntarily.`
+        );
+
+        // Notify remaining users in the room that this user has left
+        if (activeRooms[roomId].size > 0) {
+          socket.to(roomId).emit("user_left", user);
+          console.log(
+            `Notified remaining user(s) in ${roomId} that ${user.name} left.`
+          );
+        } else {
+          // Room is now empty, clean it up
+          delete activeRooms[roomId];
+          console.log(
+            `Room ${roomId} is now empty and removed after user ${user.name} left.`
+          );
+        }
+      }
+
+      // Clear socket properties for this room
+      socket.roomId = null;
+      socket.user = null;
+
+      if (callback) {
+        callback({ success: true, message: "Successfully left the room." });
+      }
+    } else {
+      console.warn(
+        `User ${user.name} tried to leave room ${roomId} but wasn't in it.`
+      );
+      if (callback) {
+        callback({
+          success: false,
+          message: "You are not currently in this room.",
+        });
+      }
+    }
   });
 
   // Cleanup on disconnect (e.g., browser tab closed, network error)
   socket.on("disconnect", () => {
-    // console.log(`Disconnected: ${socket.id}`);
+    console.log(`Disconnected: ${socket.id}`);
 
-    let disconnectedUser = null;
-    let disconnectedUserRoomId = null;
+    let disconnectedUserUid = null;
+    let disconnectedUserName = "Unknown User"; // Default name
 
-    // Find the user associated with this disconnected socket ID
+    // Find the user associated with this disconnected socket ID and remove from onlineUsers
     for (const uid in onlineUsers) {
       if (onlineUsers[uid].socketId === socket.id) {
-        disconnectedUser = onlineUsers[uid];
-        delete onlineUsers[uid]; // Remove from online users
+        disconnectedUserUid = uid;
+        disconnectedUserName = onlineUsers[uid].name; // Get the user's name
+        delete onlineUsers[uid];
         break;
       }
     }
 
-    // If the disconnected user was in a room
-    if (socket.roomId && disconnectedUser) {
-      disconnectedUserRoomId = socket.roomId;
-      const { roomId, user } = socket; // Use the stored socket.roomId and socket.user
+    // Update the list of online users for everyone
+    io.emit("update_online_users", Object.values(onlineUsers));
+
+    // If the disconnected user was in a room (check using socket.roomId and user data)
+    if (socket.roomId && socket.user) {
+      const { roomId, user } = socket;
 
       // Remove user from the room's participant set
       if (activeRooms[roomId]) {
         activeRooms[roomId].delete(user.uid);
-
+        console.log(
+          `User ${user.name} (UID: ${user.uid}) disconnected from room ${roomId}.`
+        );
         // Notify other clients in the room that this user has left
-        socket.to(roomId).emit("user_left", user);
-
-        // Check if the room is now empty or has only one participant left
-        if (activeRooms[roomId].size === 0) {
-          delete activeRooms[roomId]; // Room is empty, remove it
-          // console.log(`Room ${roomId} is now empty after disconnect.`);
-        } else if (activeRooms[roomId].size === 1) {
-          // Only one person left in the room
-          const remainingUid = activeRooms[roomId].values().next().value;
-          const remainingUserSocketId = getUserSocketId(remainingUid);
-
-          if (remainingUserSocketId) {
-            // Emit a user_left event to the remaining user,
-            // so their client-side logic redirects them.
-            io.to(remainingUserSocketId).emit("user_left", {
-              uid: user.uid, // The UID of the user who just disconnected
-              name: user.name, // The name of the user who just disconnected
-            });
-            // console.log(
-            //   `User ${user.name} disconnected. Redirecting remaining user ${remainingUid} from room ${roomId}.`
-            // );
-          }
-          delete activeRooms[roomId]; // Room should be considered closed for new joins
-          // console.log(
-          //   `Room ${roomId} now has only one user after disconnect, closing the room.`
-          // );
+        if (activeRooms[roomId].size > 0) {
+          socket.to(roomId).emit("user_left", user);
+          console.log(
+            `Notified remaining user(s) in ${roomId} that ${user.name} disconnected.`
+          );
+        } else {
+          // Room is now empty, clean it up
+          delete activeRooms[roomId];
+          console.log(
+            `Room ${roomId} is now empty and removed after disconnect.`
+          );
         }
       }
     }
-    io.emit("update_online_users", Object.values(onlineUsers)); // Update online users list
+    // If socket.roomId or socket.user were not set (e.g., user disconnected before joining a room fully)
+    // but the user was registered via new_user, we can still attempt to clean up if needed:
+    else if (disconnectedUserUid && activeRooms) {
+      for (const roomId in activeRooms) {
+        if (activeRooms[roomId].has(disconnectedUserUid)) {
+          activeRooms[roomId].delete(disconnectedUserUid);
+          console.log(
+            `Cleaned up disconnected user ${disconnectedUserName} (UID: ${disconnectedUserUid}) from room ${roomId}.`
+          );
+
+          if (activeRooms[roomId].size > 0) {
+            io.to(roomId).emit("user_left", {
+              uid: disconnectedUserUid,
+              name: disconnectedUserName,
+            });
+            console.log(
+              `Notified remaining user(s) in ${roomId} that ${disconnectedUserName} left (via disconnect cleanup).`
+            );
+          } else {
+            delete activeRooms[roomId];
+            console.log(
+              `Room ${roomId} is now empty and removed after disconnect cleanup.`
+            );
+          }
+          break; // Assuming a user is only in one room at a time
+        }
+      }
+    }
+  });
+
+  socket.on("error", (err) => {
+    console.error(`Socket error for ${socket.id}:`, err);
+    socket.emit("error", { message: "An internal server error occurred." });
   });
 });
